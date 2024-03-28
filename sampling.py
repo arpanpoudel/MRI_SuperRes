@@ -28,6 +28,8 @@ import functools
 from utils import fft2, ifft2, clear, fft2_m, ifft2_m, root_sum_of_squares
 from tqdm import tqdm
 from models import utils as mutils
+import sde_lib
+from scipy import integrate
 
 _CORRECTORS = {}
 _PREDICTORS = {}
@@ -95,20 +97,33 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
   """
 
   sampler_name = config.sampling.method
-  predictor = get_predictor(config.sampling.predictor.lower())
-  corrector = get_corrector(config.sampling.corrector.lower())
-  sampling_fn = get_pc_sampler(sde=sde,
-                               shape=shape,
-                               predictor=predictor,
-                               corrector=corrector,
-                               inverse_scaler=inverse_scaler,
-                               snr=config.sampling.snr,
-                               n_steps=config.sampling.n_steps_each,
-                               probability_flow=config.sampling.probability_flow,
-                               continuous=config.training.continuous,
-                               denoise=config.sampling.noise_removal,
-                               eps=eps,
-                               device=config.device)
+  # Probability flow ODE sampling with black-box ODE solvers
+  if sampler_name.lower() == 'ode':
+    sampling_fn = get_ode_sampler(sde=sde,
+                                  shape=shape,
+                                  inverse_scaler=inverse_scaler,
+                                  denoise=config.sampling.noise_removal,
+                                  eps=eps,
+                                  device=config.device)
+  # Predictor-Corrector sampling. Predictor-only and Corrector-only samplers are special cases.
+  elif sampler_name.lower() == 'pc':
+    predictor = get_predictor(config.sampling.predictor.lower())
+    corrector = get_corrector(config.sampling.corrector.lower())
+    sampling_fn = get_pc_sampler(sde=sde,
+                                 shape=shape,
+                                 predictor=predictor,
+                                 corrector=corrector,
+                                 inverse_scaler=inverse_scaler,
+                                 snr=config.sampling.snr,
+                                 n_steps=config.sampling.n_steps_each,
+                                 probability_flow=config.sampling.probability_flow,
+                                 continuous=config.training.continuous,
+                                 denoise=config.sampling.noise_removal,
+                                 eps=eps,
+                                 device=config.device)
+  else:
+    raise ValueError(f"Sampler name {sampler_name} unknown.")
+
   return sampling_fn
 
 
@@ -162,30 +177,102 @@ class Corrector(abc.ABC):
     pass
 
 
+@register_predictor(name='euler_maruyama')
+class EulerMaruyamaPredictor(Predictor):
+  def __init__(self, sde, score_fn, probability_flow=False):
+    super().__init__(sde, score_fn, probability_flow)
+
+  def update_fn(self, x, t):
+    dt = -1. / self.rsde.N
+    z = torch.randn_like(x)
+    drift, diffusion = self.rsde.sde(x, t)
+    x_mean = x + drift * dt
+    x = x_mean + diffusion[:, None, None, None] * np.sqrt(-dt) * z
+    return x, x_mean
+
+
 @register_predictor(name='reverse_diffusion')
 class ReverseDiffusionPredictor(Predictor):
   def __init__(self, sde, score_fn, probability_flow=False):
     super().__init__(sde, score_fn, probability_flow)
 
   def update_fn(self, x, t):
-    f, G = self.rsde.discretize(x, t)
+    f, G, score = self.rsde.discretize(x, t)
     z = torch.randn_like(x)
     x_mean = x - f
     x = x_mean + G[:, None, None, None] * z
+    return x, x_mean,score
+
+
+@register_predictor(name='ancestral_sampling')
+class AncestralSamplingPredictor(Predictor):
+  """The ancestral sampling predictor. Currently only supports VE/VP SDEs."""
+
+  def __init__(self, sde, score_fn, probability_flow=False):
+    super().__init__(sde, score_fn, probability_flow)
+    if not isinstance(sde, sde_lib.VPSDE) and not isinstance(sde, sde_lib.VESDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+    assert not probability_flow, "Probability flow not supported by ancestral sampling"
+
+  def vesde_update_fn(self, x, t):
+    sde = self.sde
+    timestep = (t * (sde.N - 1) / sde.T).long()
+    sigma = sde.discrete_sigmas[timestep]
+    adjacent_sigma = torch.where(timestep == 0, torch.zeros_like(t), sde.discrete_sigmas.to(t.device)[timestep - 1])
+    score = self.score_fn(x, t)
+    x_mean = x + score * (sigma ** 2 - adjacent_sigma ** 2)[:, None, None, None]
+    std = torch.sqrt((adjacent_sigma ** 2 * (sigma ** 2 - adjacent_sigma ** 2)) / (sigma ** 2))
+    noise = torch.randn_like(x)
+    x = x_mean + std[:, None, None, None] * noise
     return x, x_mean
+
+  def vpsde_update_fn(self, x, t):
+    sde = self.sde
+    timestep = (t * (sde.N - 1) / sde.T).long()
+    beta = sde.discrete_betas.to(t.device)[timestep]
+    score = self.score_fn(x, t)
+    x_mean = (x + beta[:, None, None, None] * score) / torch.sqrt(1. - beta)[:, None, None, None]
+    noise = torch.randn_like(x)
+    x = x_mean + torch.sqrt(beta)[:, None, None, None] * noise
+    return x, x_mean
+
+  def update_fn(self, x, t):
+    if isinstance(self.sde, sde_lib.VESDE):
+      return self.vesde_update_fn(x, t)
+    elif isinstance(self.sde, sde_lib.VPSDE):
+      return self.vpsde_update_fn(x, t)
+
+
+@register_predictor(name='none')
+class NonePredictor(Predictor):
+  """An empty predictor that does nothing."""
+
+  def __init__(self, sde, score_fn, probability_flow=False):
+    pass
+
+  def update_fn(self, x, t):
+    return x, x
 
 
 @register_corrector(name='langevin')
 class LangevinCorrector(Corrector):
   def __init__(self, sde, score_fn, snr, n_steps):
     super().__init__(sde, score_fn, snr, n_steps)
+    if not isinstance(sde, sde_lib.VPSDE) \
+        and not isinstance(sde, sde_lib.VESDE) \
+        and not isinstance(sde, sde_lib.subVPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
 
   def update_fn(self, x, t):
     sde = self.sde
     score_fn = self.score_fn
     n_steps = self.n_steps
     target_snr = self.snr
-    alpha = torch.ones_like(t)
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).long()
+      alpha = sde.alphas.to(t.device)[timestep]
+    else:
+      alpha = torch.ones_like(t)
 
     for i in range(n_steps):
       grad = score_fn(x, t)
@@ -196,21 +283,126 @@ class LangevinCorrector(Corrector):
       x_mean = x + step_size[:, None, None, None] * grad
       x = x_mean + torch.sqrt(step_size * 2)[:, None, None, None] * noise
 
+    return x, x_mean,grad
+
+
+class LangevinCorrectorCS(Corrector):
+  """ Modified Langevin Corrector to solve for p(x|y) """
+  def __init__(self, sde, score_fn, snr, n_steps, sigma_min, sigma_max, N):
+    super().__init__(sde, score_fn, snr, n_steps)
+    self.N = N
+    self.discrete_sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), N))
+    if not isinstance(sde, sde_lib.VESDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+  def update_fn(self, x, t, y, discrete_sigmas):
+    """
+    Args:
+      x: current estimate x_i
+      t: current time step
+      y: measurement in the image domain
+      discrete_sigmas: list of values of \sigma that are indexable with t
+    """
+    sde = self.sde
+    score_fn = self.score_fn
+    n_steps = self.n_steps
+    target_snr = self.snr
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).long()
+      alpha = sde.alphas.to(t.device)[timestep]
+    else:
+      alpha = torch.ones_like(t)
+
+    for i in range(n_steps):
+      timestep = (t * (self.N - 1) / 1).long()
+      sigma = self.discrete_sigmas.to(t.device)[timestep]
+      grad = score_fn(x, t)
+      grad_likelihood = (x - y) / (sigma[0] ** 2)
+      noise = torch.randn_like(x)
+      grad_norm = torch.norm(grad.reshape(grad.shape[0], -1), dim=-1).mean()
+      noise_norm = torch.norm(noise.reshape(noise.shape[0], -1), dim=-1).mean()
+      step_size = (target_snr * noise_norm / grad_norm) ** 2 * 2 * alpha
+      x_mean = x + step_size[:, None, None, None] * (grad + grad_likelihood)
+      x = x_mean + torch.sqrt(step_size * 2)[:, None, None, None] * noise
+
     return x, x_mean
+
+
+@register_corrector(name='ald')
+class AnnealedLangevinDynamics(Corrector):
+  """The original annealed Langevin dynamics predictor in NCSN/NCSNv2.
+
+  We include this corrector only for completeness. It was not directly used in our paper.
+  """
+
+  def __init__(self, sde, score_fn, snr, n_steps):
+    super().__init__(sde, score_fn, snr, n_steps)
+    if not isinstance(sde, sde_lib.VPSDE) \
+        and not isinstance(sde, sde_lib.VESDE) \
+        and not isinstance(sde, sde_lib.subVPSDE):
+      raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
+
+  def update_fn(self, x, t):
+    sde = self.sde
+    score_fn = self.score_fn
+    n_steps = self.n_steps
+    target_snr = self.snr
+    if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
+      timestep = (t * (sde.N - 1) / sde.T).long()
+      alpha = sde.alphas.to(t.device)[timestep]
+    else:
+      alpha = torch.ones_like(t)
+
+    std = self.sde.marginal_prob(x, t)[1]
+
+    for i in range(n_steps):
+      grad = score_fn(x, t)
+      noise = torch.randn_like(x)
+      step_size = (target_snr * std) ** 2 * 2 * alpha
+      x_mean = x + step_size[:, None, None, None] * grad
+      x = x_mean + noise * torch.sqrt(step_size * 2)[:, None, None, None]
+
+    return x, x_mean
+
+
+@register_corrector(name='none')
+class NoneCorrector(Corrector):
+  """An empty corrector that does nothing."""
+
+  def __init__(self, sde, score_fn, snr, n_steps):
+    pass
+
+  def update_fn(self, x, t):
+    return x, x
 
 
 def shared_predictor_update_fn(x, t, sde, model, predictor, probability_flow, continuous):
   """A wrapper that configures and returns the update function of predictors."""
   score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
-  predictor_obj = predictor(sde, score_fn, probability_flow)
+  if predictor is None:
+    # Corrector-only sampler
+    predictor_obj = NonePredictor(sde, score_fn, probability_flow)
+  else:
+    predictor_obj = predictor(sde, score_fn, probability_flow)
   return predictor_obj.update_fn(x, t)
 
 
-def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_steps):
+def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_steps, cs=False,
+                               sigma_min=None, sigma_max=None, N=None, y=None, discrete_sigmas=None):
   """A wrapper tha configures and returns the update function of correctors."""
   score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
-  corrector_obj = corrector(sde, score_fn, snr, n_steps)
-  fn = corrector_obj.update_fn(x, t)
+  if corrector is None:
+    # Predictor-only sampler
+    corrector_obj = NoneCorrector(sde, score_fn, snr, n_steps)
+    fn = corrector_obj.update_fn(x, t)
+  else:
+    if cs:
+      corrector_obj = corrector(sde, score_fn, snr, n_steps, sigma_min, sigma_max, N)
+      fn = corrector_obj.update_fn(x, t, y, discrete_sigmas)
+    else:
+      corrector_obj = corrector(sde, score_fn, snr, n_steps)
+      fn = corrector_obj.update_fn(x, t)
+
   return fn
 
 
@@ -264,14 +456,14 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
 
       time_corrector_tot = 0
       time_predictor_tot = 0
-      for i in range(sde.N):
+      for i in tqdm(range(sde.N)):
         t = timesteps[i]
         vec_t = torch.ones(shape[0], device=t.device) * t
         tic_corrector = time.time()
-        x, x_mean = corrector_update_fn(x, vec_t, model=model)
+        x, x_mean,_ = corrector_update_fn(x, vec_t, model=model)
         time_corrector_tot += time.time() - tic_corrector
         tic_predictor = time.time()
-        x, x_mean = predictor_update_fn(x, vec_t, model=model)
+        x, x_mean,_ = predictor_update_fn(x, vec_t, model=model)
         time_predictor_tot += time.time() - tic_predictor
       print(f'Average time for corrector step: {time_corrector_tot / sde.N} sec.')
       print(f'Average time for predictor step: {time_predictor_tot / sde.N} sec.')
@@ -281,329 +473,75 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
   return pc_sampler
 
 
-def get_pc_fouriercs_fast(sde, predictor, corrector, inverse_scaler, snr,
-                          n_steps=1, probability_flow=False, continuous=False,
-                          denoise=True, eps=1e-5, save_progress=False, save_root=None):
-  """Create a PC sampler for solving compressed sensing problems as in MRI reconstruction.
+def get_ode_sampler(sde, shape, inverse_scaler,
+                    denoise=False, rtol=1e-5, atol=1e-5,
+                    method='RK45', eps=1e-3, device='cuda'):
+  """Probability flow ODE sampler with the black-box ODE solver.
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
-    predictor: A subclass of `sampling.Predictor` that represents a predictor algorithm.
-    corrector: A subclass of `sampling.Corrector` that represents a corrector algorithm.
+    shape: A sequence of integers. The expected shape of a single sample.
     inverse_scaler: The inverse data normalizer.
-    snr: A `float` number. The signal-to-noise ratio for the corrector.
-    n_steps: An integer. The number of corrector steps per update of the corrector.
-    continuous: `True` indicates that the score-based model was trained with continuous time.
     denoise: If `True`, add one-step denoising to final samples.
-    eps: A `float` number. The reverse-time SDE/ODE is integrated to `eps` for numerical stability.
+    rtol: A `float` number. The relative tolerance level of the ODE solver.
+    atol: A `float` number. The absolute tolerance level of the ODE solver.
+    method: A `str`. The algorithm used for the black-box ODE solver.
+      See the documentation of `scipy.integrate.solve_ivp`.
+    eps: A `float` number. The reverse-time SDE/ODE will be integrated to `eps` for numerical stability.
+    device: PyTorch device.
 
   Returns:
-    A CS solver function.
+    A sampling function that returns samples and the number of function evaluations during sampling.
   """
-  # Define predictor & corrector
-  predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                          sde=sde,
-                                          predictor=predictor,
-                                          probability_flow=probability_flow,
-                                          continuous=continuous)
-  corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                          sde=sde,
-                                          corrector=corrector,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps)
 
-  def data_fidelity(mask, x, Fy):
-      """
-      Data fidelity operation for Fourier CS
-      x: Current aliased img
-      Fy: k-space measurement data (masked)
-      """
-      x = torch.real(ifft2(fft2(x) * (1. - mask) + Fy))
-      x_mean = torch.real(ifft2(fft2(x) * (1. - mask) + Fy))
-      return x, x_mean
+  def denoise_update_fn(model, x):
+    score_fn = mutils.get_score_fn(sde, model, train=False, continuous=True)
+    # Reverse diffusion predictor for denoising
+    predictor_obj = ReverseDiffusionPredictor(sde, score_fn, probability_flow=False)
+    vec_eps = torch.ones(x.shape[0], device=x.device) * eps
+    _, x = predictor_obj.update_fn(x, vec_eps)
+    return x
 
-  def get_fouriercs_update_fn(update_fn):
-    """Modify the update function of predictor & corrector to incorporate data information."""
+  def drift_fn(model, x, t):
+    """Get the drift function of the reverse-time SDE."""
+    score_fn = mutils.get_score_fn(sde, model, train=False, continuous=True)
+    rsde = sde.reverse(score_fn, probability_flow=True)
+    return rsde.sde(x, t)[0]  # returns only the drift term because diffusion = 0 for probability_flow
 
-    def fouriercs_update_fn(model, data, mask, x, t, Fy=None):
-      with torch.no_grad():
-        vec_t = torch.ones(data.shape[0], device=data.device) * t
-        x, x_mean = update_fn(x, vec_t, model=model)
-        x, x_mean = data_fidelity(mask, x, Fy)
-        return x, x_mean
+  def ode_sampler(model, z=None):
+    """The probability flow ODE sampler with black-box ODE solver.
 
-    return fouriercs_update_fn
-
-  projector_fouriercs_update_fn = get_fouriercs_update_fn(predictor_update_fn)
-  corrector_fouriercs_update_fn = get_fouriercs_update_fn(corrector_update_fn)
-
-  def pc_fouriercs(model, data, mask, Fy=None):
+    Args:
+      model: A score model.
+      z: If present, generate samples from latent code `z`.
+    Returns:
+      samples, number of function evaluations.
+    """
     with torch.no_grad():
       # Initial sample
-      x = torch.real(ifft2(Fy + fft2(sde.prior_sampling(data.shape).to(data.device)) * (1. - mask)))
-      timesteps = torch.linspace(sde.T, eps, sde.N)
-      for i in tqdm(range(sde.N), total=sde.N):
-        t = timesteps[i]
-        x, x_mean = corrector_fouriercs_update_fn(model, data, mask, x, t, Fy=Fy)
-        x, x_mean = projector_fouriercs_update_fn(model, data, mask, x, t, Fy=Fy)
-        if save_progress and i >= 300 and i % 100 == 0:
-          plt.imsave(save_root / f'step{i}.png', clear(x_mean), cmap='gray')
+      if z is None:
+        # If not represent, sample the latent code from the prior distibution of the SDE.
+        x = sde.prior_sampling(shape).to(device)
+      else:
+        x = z
 
-      return inverse_scaler(x_mean if denoise else x)
+      def ode_func(t, x):
+        x = mutils.from_flattened_numpy(x, shape).to(device).type(torch.float32)
+        vec_t = torch.ones(shape[0], device=x.device) * t
+        drift = drift_fn(model, x, vec_t)
+        return mutils.to_flattened_numpy(drift)
 
-  return pc_fouriercs
+      # Black-box ODE solver for the probability flow ODE
+      solution = integrate.solve_ivp(ode_func, (sde.T, eps), mutils.to_flattened_numpy(x),
+                                     rtol=rtol, atol=atol, method=method)
+      nfe = solution.nfev
+      x = torch.tensor(solution.y[:, -1]).reshape(shape).to(device).type(torch.float32)
 
+      # Denoising is equivalent to running one predictor step without adding noise
+      if denoise:
+        x = denoise_update_fn(model, x)
 
-def get_pc_fouriercs_RI(sde, predictor, corrector, inverse_scaler, snr,
-                        n_steps=1, probability_flow=False, continuous=False,
-                        denoise=True, eps=1e-5):
-  # Define predictor & corrector
-  predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                          sde=sde,
-                                          predictor=predictor,
-                                          probability_flow=probability_flow,
-                                          continuous=continuous)
-  corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                          sde=sde,
-                                          corrector=corrector,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps)
+      x = inverse_scaler(x)
+      return x, nfe
 
-  def data_fidelity(mask, x, x_mean, Fy):
-      x = ifft2(fft2(x) * (1. - mask) + Fy)
-      x_mean = ifft2(fft2(x_mean) * (1. - mask) + Fy)
-      return x, x_mean
-
-  def get_fouriercs_update_fn(update_fn):
-    def fouriercs_update_fn(model, data, mask, x, t, Fy=None):
-      with torch.no_grad():
-        vec_t = torch.ones(data.shape[0], device=data.device) * t
-        # split real / imag part
-        x_real = torch.real(x)
-        x_imag = torch.imag(x)
-
-        # perform update step with real / imag part seperately
-        x_real, x_real_mean = update_fn(x_real, vec_t, model=model)
-        x_imag, x_imag_mean = update_fn(x_imag, vec_t, model=model)
-
-        # merge real / imag values to form complex image
-        x = x_real + 1j * x_imag
-        x_mean = x_real_mean + 1j * x_imag_mean
-        x, x_mean = data_fidelity(mask, x, x_mean, Fy)
-        return x, x_mean
-
-    return fouriercs_update_fn
-
-  projector_fouriercs_update_fn = get_fouriercs_update_fn(predictor_update_fn)
-  corrector_fouriercs_update_fn = get_fouriercs_update_fn(corrector_update_fn)
-
-  def pc_fouriercs(model, data, mask, Fy=None):
-    with torch.no_grad():
-      # Initial sample (complex-valued)
-      x = ifft2(Fy + fft2(sde.prior_sampling(data.shape).to(data.device)) * (1. - mask))
-      timesteps = torch.linspace(sde.T, eps, sde.N)
-      for i in tqdm(range(sde.N)):
-        t = timesteps[i]
-        x, x_mean = corrector_fouriercs_update_fn(model, data, mask, x, t, Fy=Fy)
-        x, x_mean = projector_fouriercs_update_fn(model, data, mask, x, t, Fy=Fy)
-
-      return inverse_scaler(x_mean if denoise else x)
-
-  return pc_fouriercs
-
-
-def get_pc_fouriercs_RI_PI_SSOS(sde, predictor, corrector, inverse_scaler, snr,
-                                n_steps=1, probability_flow=False, continuous=False,
-                                denoise=True, eps=1e-5, mask=None,
-                                save_progress=False, save_root=None):
-  # Define predictor & corrector
-  predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                          sde=sde,
-                                          predictor=predictor,
-                                          probability_flow=probability_flow,
-                                          continuous=continuous)
-  corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                          sde=sde,
-                                          corrector=corrector,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps)
-
-  # functions to impose data fidelity 1/2\|Ax - y\|^2
-  def data_fidelity(mask, x, x_mean, y):
-      x = ifft2_m(fft2_m(x) * (1. - mask) + y)
-      x_mean = ifft2_m(fft2_m(x_mean) * (1. - mask) + y)
-      return x, x_mean
-
-  def get_coil_update_fn(update_fn):
-    def fouriercs_update_fn(model, data, x, t, y=None):
-      with torch.no_grad():
-        vec_t = torch.ones(data.shape[0], device=data.device) * t
-        # split real / imag part
-        x_real = torch.real(x)
-        x_imag = torch.imag(x)
-
-        # perform update step with real / imag part seperately
-        x_real, x_real_mean = update_fn(x_real, vec_t, model=model)
-        x_imag, x_imag_mean = update_fn(x_imag, vec_t, model=model)
-
-        # merge real / imag values to form complex image
-        x = x_real + 1j * x_imag
-        x_mean = x_real_mean + 1j * x_imag_mean
-
-        # coil mask
-        mask_c = mask[0, 0, :, :].squeeze()
-        x, x_mean = data_fidelity(mask_c, x, x_mean, y)
-        return x, x_mean
-
-    return fouriercs_update_fn
-
-  predictor_coil_update_fn = get_coil_update_fn(predictor_update_fn)
-  corrector_coil_update_fn = get_coil_update_fn(corrector_update_fn)
-
-  def pc_fouriercs(model, data, y=None):
-    with torch.no_grad():
-      # Initial sample: [1, 15, 320, 320] (dtype: torch.complex64)
-      x_r = sde.prior_sampling(data.shape).to(data.device)
-      x_i = sde.prior_sampling(data.shape).to(data.device)
-      x = torch.complex(x_r, x_i)
-      x_mean = x.clone().detach()
-
-      timesteps = torch.linspace(sde.T, eps, sde.N)
-
-      # number of iterations of PC sampler
-      for i in tqdm(range(sde.N)):
-        # coil x_c update
-        for c in range(15):
-          t = timesteps[i]
-          # slicing the dimension with c:c+1 ("one-element slice") preserves dimension
-          x_c = x[:, c:c+1, :, :]
-          y_c = y[:, c:c+1, :, :]
-          x_c, x_c_mean = predictor_coil_update_fn(model, data, x_c, t, y=y_c)
-          x_c, x_c_mean = corrector_coil_update_fn(model, data, x_c, t, y=y_c)
-
-          # Assign coil dates to the global x, x_mean
-          x[:, c, :, :] = x_c
-          x_mean[:, c, :, :] = x_c_mean
-        if save_progress:
-          if i % 100 == 0:
-            for c in range(15):
-              x_c = clear(x[:, c:c+1, :, :])
-              plt.imsave(save_root / 'recon' / f'coil{c}' / f'after{i}.png', np.abs(x_c), cmap='gray')
-            x_rss = clear(root_sum_of_squares(torch.abs(x), dim=1).squeeze())
-            plt.imsave(save_root / 'recon' / f'after{i}.png', x_rss, cmap='gray')
-
-      return inverse_scaler(x_mean if denoise else x)
-
-  return pc_fouriercs
-
-
-def get_pc_fouriercs_RI_coil_SENSE(sde, predictor, corrector, inverse_scaler, snr,
-                                   n_steps=1, lamb_schedule=None, probability_flow=False, continuous=False,
-                                   denoise=True, eps=1e-5, sens=None, mask=None, m_steps=10,
-                                   save_progress=False, save_root=None):
-  '''Every once in a while during separate coil reconstruction,
-  apply SENSE data consistency and incorporate information.
-  (Args)
-    (sens): sensitivity maps
-    (m_steps): frequency in which SENSE operation is incorporated
-  '''
-  # Define predictor & corrector
-  predictor_update_fn = functools.partial(shared_predictor_update_fn,
-                                          sde=sde,
-                                          predictor=predictor,
-                                          probability_flow=probability_flow,
-                                          continuous=continuous)
-  corrector_update_fn = functools.partial(shared_corrector_update_fn,
-                                          sde=sde,
-                                          corrector=corrector,
-                                          continuous=continuous,
-                                          snr=snr,
-                                          n_steps=n_steps)
-
-  # functions to impose data fidelity 1/2\|Ax - y\|^2
-  def data_fidelity(mask, x, x_mean, y):
-      x = ifft2_m(fft2_m(x) * (1. - mask) + y)
-      x_mean = ifft2_m(fft2_m(x_mean) * (1. - mask) + y)
-      return x, x_mean
-
-  def A(x, sens=sens, mask=mask):
-      return mask * fft2_m(sens * x)
-
-  def A_H(x, sens=sens, mask=mask):  # Hermitian transpose
-      return torch.sum(torch.conj(sens) * ifft2_m(x * mask), dim=1).unsqueeze(dim=1)
-
-  def kaczmarz(x, x_mean, y, lamb=1.0):
-      x = x + lamb * A_H(y - A(x))
-      x_mean = x_mean + lamb * A_H(y - A(x_mean))
-      return x, x_mean
-
-  def get_coil_update_fn(update_fn):
-    def fouriercs_update_fn(model, data, x, t, y=None):
-      with torch.no_grad():
-        vec_t = torch.ones(data.shape[0], device=data.device) * t
-        # split real / imag part
-        x_real = torch.real(x)
-        x_imag = torch.imag(x)
-
-        # perform update step with real / imag part seperately
-        x_real, x_real_mean = update_fn(x_real, vec_t, model=model)
-        x_imag, x_imag_mean = update_fn(x_imag, vec_t, model=model)
-
-        # merge real / imag values to form complex image
-        x = x_real + 1j * x_imag
-        x_mean = x_real_mean + 1j * x_imag_mean
-
-        # coil mask
-        mask_c = mask[0, 0, :, :].squeeze()
-        x, x_mean = data_fidelity(mask_c, x, x_mean, y)
-        return x, x_mean
-
-    return fouriercs_update_fn
-
-  predictor_coil_update_fn = get_coil_update_fn(predictor_update_fn)
-  corrector_coil_update_fn = get_coil_update_fn(corrector_update_fn)
-
-  def pc_fouriercs(model, data, y=None):
-    with torch.no_grad():
-      # Initial sample: [1, 15, 320, 320] (dtype: torch.complex64)
-      x_r = sde.prior_sampling(data.shape).to(data.device)
-      x_i = sde.prior_sampling(data.shape).to(data.device)
-      x = torch.complex(x_r, x_i)
-      x_mean = x.clone().detach()
-
-      timesteps = torch.linspace(sde.T, eps, sde.N)
-
-      # number of iterations of PC sampler
-      for i in tqdm(range(sde.N)):
-        # coil x_c update
-        for c in range(15):
-          t = timesteps[i]
-
-          # slicing the dimension with c:c+1 ("one-element slice") preserves dimension
-          x_c = x[:, c:c+1, :, :]
-          y_c = y[:, c:c+1, :, :]
-          x_c, x_c_mean = predictor_coil_update_fn(model, data, x_c, t, y=y_c)
-          x_c, x_c_mean = corrector_coil_update_fn(model, data, x_c, t, y=y_c)
-
-          # Assign coil dates to the global x, x_mean
-          x[:, c, :, :] = x_c
-          x_mean[:, c, :, :] = x_c_mean
-
-        # global x update
-        if i % m_steps == 0:
-          lamb = lamb_schedule.get_current_lambda(i)
-          x, x_mean = kaczmarz(x, x_mean, y, lamb=lamb)
-        if save_progress:
-          if i % 100 == 0:
-            for c in range(15):
-              x_c = clear(x[:, c:c+1, :, :])
-              plt.imsave(save_root / 'recon' / f'coil{c}' / f'after{i}.png', np.abs(x_c), cmap='gray')
-            x_rss = clear(root_sum_of_squares(torch.abs(x), dim=1).squeeze())
-            plt.imsave(save_root / 'recon' / f'after{i}.png', x_rss, cmap='gray')
-
-      return inverse_scaler(x_mean if denoise else x)
-
-  return pc_fouriercs
+  return ode_sampler

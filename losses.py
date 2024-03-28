@@ -20,7 +20,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 from models import utils as mutils
-from sde_lib import VESDE, VPSDE
+from sde_lib import VESDE
 from utils import fft2, ifft2, get_mask
 import numpy as np
 import time

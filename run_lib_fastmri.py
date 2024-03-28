@@ -20,24 +20,26 @@ import gc
 import io
 import os
 import time
+import sys
 
 import numpy as np
+
+import torch
+from torch import nn
 import tensorflow as tf
 import tensorflow_gan as tfgan
 import logging
 # Keep the import below for registering all model definitions
-from models import ddpm, ncsnv2, ncsnpp, unet
+from models import  ncsnpp
 import losses
 import sampling
 from models import utils as mutils
 from models.ema import ExponentialMovingAverage
 import datasets
-import evaluation
-import likelihood
 import sde_lib
 from absl import flags
-import torch
-from torch import nn
+from torchvision import transforms as T 
+
 from torch.utils import tensorboard
 from torchvision.utils import make_grid, save_image
 from utils import save_checkpoint, restore_checkpoint, get_mask, kspace_to_nchw, root_sum_of_squares
@@ -74,11 +76,15 @@ def train(config, workdir):
   tf.io.gfile.makedirs(checkpoint_dir)
   tf.io.gfile.makedirs(os.path.dirname(checkpoint_meta_dir))
   # Resume training when intermediate checkpoints are detected
-  state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
+  state = dict(step=0, optimizer=optimizer,model=score_model, ema=ema)
+  if tf.io.gfile.exists(checkpoint_meta_dir):
+    state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
   initial_step = int(state['step'])
 
   # Build pytorch dataloader for training
-  train_dl, eval_dl = datasets.create_dataloader(config)
+  #transform=T.Compose([T.ToTensor()])
+  transform=T.Compose([T.ToTensor(), T.Resize((config.data.image_size1,config.data.image_size2),antialias=True)])
+  train_dl= datasets.create_dataloader(config,transform=transform)
   num_data = len(train_dl.dataset)
 
   # Create data normalizer and its inverse
@@ -113,7 +119,7 @@ def train(config, workdir):
   # Building sampling functions
   if config.training.snapshot_sampling:
     sampling_shape = (config.training.batch_size, config.data.num_channels,
-                      config.data.image_size, config.data.image_size)
+                      config.data.image_size1, config.data.image_size2)
     sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
 
   # In case there are multiple hosts (e.g., TPU pods), only log to host 0
@@ -145,15 +151,16 @@ def train(config, workdir):
       #   writer.add_scalar("eval_loss", scalar_value=eval_loss.item(), global_step=global_step)
 
     # Save a checkpoint for every epoch
-    save_checkpoint(os.path.join(checkpoint_dir, f'checkpoint_{epoch}.pth'), state)
+    #save every to increase training time
+    if epoch % config.training.save_every == 0:
+      save_checkpoint(os.path.join(checkpoint_dir, f'checkpoint_{epoch}.pth'), state)
+
 
     # Generate and save samples for every epoch
-    if config.training.snapshot_sampling:
+    if config.training.snapshot_sampling and epoch % config.training.sample_every == 0:
       ema.store(score_model.parameters())
       ema.copy_to(score_model.parameters())
       sample, n = sampling_fn(score_model)
-      if config.data.is_complex:
-        sample = root_sum_of_squares(sample, dim=1).unsqueeze(dim=0)
       ema.restore(score_model.parameters())
       this_sample_dir = os.path.join(sample_dir, "iter_{}".format(epoch))
       tf.io.gfile.makedirs(this_sample_dir)

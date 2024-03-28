@@ -102,11 +102,107 @@ class SDE(abc.ABC):
       def discretize(self, x, t):
         """Create discretized iteration rules for the reverse diffusion sampler."""
         f, G = discretize_fn(x, t)
-        rev_f = f - G[:, None, None, None] ** 2 * score_fn(x, t) * (0.5 if self.probability_flow else 1.)
+        score = score_fn(x, t)
+        rev_f = f - G[:, None, None, None] ** 2 * score * (0.5 if self.probability_flow else 1.)
         rev_G = torch.zeros_like(G) if self.probability_flow else G
-        return rev_f, rev_G
+        return rev_f, rev_G, score
 
     return RSDE()
+
+
+class VPSDE(SDE):
+  def __init__(self, beta_min=0.1, beta_max=20, N=1000):
+    """Construct a Variance Preserving SDE.
+
+    Args:
+      beta_min: value of beta(0)
+      beta_max: value of beta(1)
+      N: number of discretization steps
+    """
+    super().__init__(N)
+    self.beta_0 = beta_min
+    self.beta_1 = beta_max
+    self.N = N
+    self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
+    self.alphas = 1. - self.discrete_betas
+    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+    self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+    self.sqrt_1m_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+
+  @property
+  def T(self):
+    return 1
+
+  def sde(self, x, t):
+    beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
+    drift = -0.5 * beta_t[:, None, None, None] * x
+    diffusion = torch.sqrt(beta_t)
+    return drift, diffusion
+
+  def marginal_prob(self, x, t):
+    log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+    mean = torch.exp(log_mean_coeff[:, None, None, None]) * x
+    std = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
+    return mean, std
+
+  def prior_sampling(self, shape):
+    return torch.randn(*shape)
+
+  def prior_logp(self, z):
+    shape = z.shape
+    N = np.prod(shape[1:])
+    logps = -N / 2. * np.log(2 * np.pi) - torch.sum(z ** 2, dim=(1, 2, 3)) / 2.
+    return logps
+
+  def discretize(self, x, t):
+    """DDPM discretization."""
+    timestep = (t * (self.N - 1) / self.T).long()
+    beta = self.discrete_betas.to(x.device)[timestep]
+    alpha = self.alphas.to(x.device)[timestep]
+    sqrt_beta = torch.sqrt(beta)
+    f = torch.sqrt(alpha)[:, None, None, None] * x - x
+    G = sqrt_beta
+    return f, G
+
+
+class subVPSDE(SDE):
+  def __init__(self, beta_min=0.1, beta_max=20, N=1000):
+    """Construct the sub-VP SDE that excels at likelihoods.
+
+    Args:
+      beta_min: value of beta(0)
+      beta_max: value of beta(1)
+      N: number of discretization steps
+    """
+    super().__init__(N)
+    self.beta_0 = beta_min
+    self.beta_1 = beta_max
+    self.N = N
+
+  @property
+  def T(self):
+    return 1
+
+  def sde(self, x, t):
+    beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
+    drift = -0.5 * beta_t[:, None, None, None] * x
+    discount = 1. - torch.exp(-2 * self.beta_0 * t - (self.beta_1 - self.beta_0) * t ** 2)
+    diffusion = torch.sqrt(beta_t * discount)
+    return drift, diffusion
+
+  def marginal_prob(self, x, t):
+    log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+    mean = torch.exp(log_mean_coeff)[:, None, None, None] * x
+    std = 1 - torch.exp(2. * log_mean_coeff)
+    return mean, std
+
+  def prior_sampling(self, shape):
+    return torch.randn(*shape)
+
+  def prior_logp(self, z):
+    shape = z.shape
+    N = np.prod(shape[1:])
+    return -N / 2. * np.log(2 * np.pi) - torch.sum(z ** 2, dim=(1, 2, 3)) / 2.
 
 
 class VESDE(SDE):
@@ -153,7 +249,7 @@ class VESDE(SDE):
     timestep = (t * (self.N - 1) / self.T).long()
     sigma = self.discrete_sigmas.to(t.device)[timestep]
     adjacent_sigma = torch.where(timestep == 0, torch.zeros_like(t),
-                                 self.discrete_sigmas[timestep - 1].to(t.device))
+                                 self.discrete_sigmas.to(t.device)[timestep - 1])
     f = torch.zeros_like(x)
     G = torch.sqrt(sigma ** 2 - adjacent_sigma ** 2)
     return f, G

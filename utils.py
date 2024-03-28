@@ -5,6 +5,7 @@ import numpy as np
 from fastmri_utils import fft2c_new, ifft2c_new
 from statistics import mean, stdev
 from sigpy.mri import poisson
+import os
 
 
 """
@@ -51,6 +52,10 @@ def normalize_np(img):
   img /= np.max(img)
   return img
 
+def min_max_normalize(image):
+    """ Normalize img in arbitrary range to [1, 1] """
+    normalized_image = (image - np.min(image)) / (np.max(image) - np.min(image))
+    return normalized_image
 
 def normalize_complex(img):
   """ normalizes the magnitude of complex-valued image to range [0, 1] """
@@ -253,14 +258,87 @@ def get_data_inverse_scaler(config):
     return lambda x: x
 
 
-def restore_checkpoint(ckpt_dir, state, device, skip_sigma=False):
-  loaded_state = torch.load(ckpt_dir, map_location=device)
-  loaded_model_state = loaded_state['model']
-  if skip_sigma:
-    loaded_model_state.pop('module.sigmas')
+import tensorflow as tf
+import logging
 
-  state['model'].load_state_dict(loaded_model_state, strict=False)
-  state['ema'].load_state_dict(loaded_state['ema'])
-  state['step'] = loaded_state['step']
-  print(f'loaded checkpoint dir from {ckpt_dir}')
-  return state
+def restore_checkpoint(ckpt_dir, state, device, skip_sigma=False, skip_optimizer=False):
+  if not tf.io.gfile.exists(ckpt_dir):
+    tf.io.gfile.makedirs(os.path.dirname(ckpt_dir))
+    logging.error(f"No checkpoint found at {ckpt_dir}. "
+                  f"Returned the same state as input")
+    FileNotFoundError(f'No such checkpoint: {ckpt_dir} found!')
+    return state
+  else:
+    loaded_state = torch.load(ckpt_dir, map_location=device)
+    if not skip_optimizer:
+      state['optimizer'].load_state_dict(loaded_state['optimizer'])
+    loaded_model_state = loaded_state['model']
+    if skip_sigma:
+      loaded_model_state.pop('module.sigmas')
+
+    state['model'].load_state_dict(loaded_model_state, strict=False)
+    state['ema'].load_state_dict(loaded_state['ema'])
+    state['step'] = loaded_state['step']
+    print(f'loaded checkpoint dir from {ckpt_dir}')
+    return state
+
+
+def show_samples(x, sz=32):
+  x = x.permute(0, 2, 3, 1).detach().cpu().numpy()
+  img = image_grid(x, sz)
+  plt.figure(figsize=(8, 8))
+  plt.axis('off')
+  plt.imshow(img)
+  plt.show()
+
+
+def image_grid_gray(x, size=32):
+  img = x.reshape(-1, size, size)
+  w = int(np.sqrt(img.shape[0]))
+  img = img.reshape((w, w, size, size)).transpose((0, 2, 1, 3)).reshape((w * size, w * size))
+  return img
+
+
+def show_samples_gray(x, size=32, save=False, save_fname=None):
+  x = x.detach().cpu().numpy()
+  img = image_grid_gray(x, size=size)
+  plt.figure(figsize=(8, 8))
+  plt.axis('off')
+  plt.imshow(img, cmap='gray')
+  plt.show()
+  if save:
+    plt.imsave(save_fname, img, cmap='gray')
+
+
+def save_checkpoint(ckpt_dir, state):
+  saved_state = {
+    'optimizer': state['optimizer'].state_dict(),
+    'model': state['model'].state_dict(),
+    'ema': state['ema'].state_dict(),
+    'step': state['step']
+  }
+  torch.save(saved_state, ckpt_dir)
+  
+  
+import logging
+def get_logger():
+    logger = logging.getLogger(name='DPS')
+    logging.basicConfig(filename="DPS",level=logging.INFO)
+
+    
+    formatter = logging.Formatter("%(asctime)s [%(name)s] >> %(message)s")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    
+    return logger
+
+
+def clear_color(x):
+    if torch.is_complex(x):
+        x = torch.abs(x)
+    x = x.detach().cpu().squeeze().numpy()
+    return normalize_np(np.transpose(x, (1, 2, 0)))
+  
+
+

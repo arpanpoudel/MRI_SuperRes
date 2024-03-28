@@ -16,10 +16,13 @@
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
 import jax
+import torch
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+from torchvision import transforms as T
+from utils import normalize_np
 
 
 def get_data_scaler(config):
@@ -203,127 +206,35 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
 
 from pathlib import Path
 
-class fastmri_knee(Dataset):
-  """ Simple pytorch dataset for fastmri knee singlecoil dataset """
-  def __init__(self, root, is_complex=False):
-    self.root = root
-    self.data_list = list(root.glob('*/*.npy'))
-    self.is_complex = is_complex
-
-  def __len__(self):
-    return len(self.data_list)
-
-  def __getitem__(self, idx):
-    fname = self.data_list[idx]
-    if not self.is_complex:
-      data = np.load(fname)
-    else:
-      data = np.load(fname).astype(np.complex64)
-    data = np.expand_dims(data, axis=0)
-    return data
-
-
-class fastmri_knee_infer(Dataset):
-  """ Simple pytorch dataset for fastmri knee singlecoil dataset """
-  def __init__(self, root, sort=True, is_complex=False):
-    self.root = root
-    self.data_list = list(root.glob('*/*.npy'))
-    self.is_complex = is_complex
-    if sort:
-      self.data_list = sorted(self.data_list)
-
-  def __len__(self):
-    return len(self.data_list)
-
-  def __getitem__(self, idx):
-    fname = self.data_list[idx]
-    if not self.is_complex:
-      data = np.load(fname)
-    else:
-      data = np.load(fname).astype(np.complex64)
-    data = np.expand_dims(data, axis=0)
-    return data, str(fname)
-
-
-class fastmri_knee_magpha(Dataset):
-  """ Simple pytorch dataset for fastmri knee singlecoil dataset """
-  def __init__(self, root):
-    self.root = root
-    self.data_list = list(root.glob('*/*.npy'))
-
-  def __len__(self):
-    return len(self.data_list)
-
-  def __getitem__(self, idx):
-    fname = self.data_list[idx]
-    data = np.load(fname).astype(np.float32)
-    return data
-
-
-class fastmri_knee_magpha_infer(Dataset):
-  """ Simple pytorch dataset for fastmri knee singlecoil dataset """
-  def __init__(self, root, sort=True):
-    self.root = root
-    self.data_list = list(root.glob('*/*.npy'))
-    if sort:
-      self.data_list = sorted(self.data_list)
-
-  def __len__(self):
-    return len(self.data_list)
-
-  def __getitem__(self, idx):
-    fname = self.data_list[idx]
-    data = np.load(fname).astype(np.float32)
-    return data, str(fname)
-
-
-def create_dataloader(configs, evaluation=False, sort=True):
-  shuffle = True if not evaluation else False
-  if configs.data.is_multi:
-    train_dataset = fastmri_knee(Path(configs.data.root) / f'knee_multicoil_{configs.data.image_size}_train')
-    val_dataset = fastmri_knee_infer(Path(configs.data.root) / f'knee_{configs.data.image_size}_val', sort=sort)
-  elif configs.data.is_complex:
-    if configs.data.magpha:
-      train_dataset = fastmri_knee_magpha(Path(configs.data.root) / f'knee_complex_magpha_{configs.data.image_size}_train')
-      val_dataset = fastmri_knee_magpha_infer(Path(configs.data.root) / f'knee_complex_magpha_{configs.data.image_size}_val')
-    else:
-      train_dataset = fastmri_knee(Path(configs.data.root) / f'knee_complex_{configs.data.image_size}_train', is_complex=True)
-      val_dataset = fastmri_knee_infer(Path(configs.data.root) / f'knee_complex_{configs.data.image_size}_val', is_complex=True)
-  else:
-    train_dataset = fastmri_knee(Path(configs.data.root) / f'knee_{configs.data.image_size}_train')
-    val_dataset = fastmri_knee_infer(Path(configs.data.root) / f'knee_{configs.data.image_size}_val', sort=sort)
-
-  train_loader = DataLoader(
-    dataset=train_dataset,
-    batch_size=configs.training.batch_size,
-    shuffle=shuffle,
-    drop_last=True
-  )
-  val_loader = DataLoader(
-    dataset=val_dataset,
-    batch_size=configs.training.batch_size,
-    # shuffle=False,
-    shuffle=True,
-    drop_last=True
-  )
-  return train_loader, val_loader
-
-
-def create_dataloader_regression(configs, evaluation=False):
-  shuffle = True if not evaluation else False
-  train_dataset = fastmri_knee(Path(configs.root) / f'knee_{configs.image_size}_train')
-  val_dataset = fastmri_knee_infer(Path(configs.root) / f'knee_{configs.image_size}_val')
-
-  train_loader = DataLoader(
-    dataset=train_dataset,
-    batch_size=configs.batch_size,
-    shuffle=shuffle,
-    drop_last=True
-  )
-  val_loader = DataLoader(
-    dataset=val_dataset,
-    batch_size=configs.batch_size,
-    shuffle=False,
-    drop_last=True
-  )
-  return train_loader, val_loader
+#MRI dataset
+#MRI dataset
+class MRI_dataset(Dataset):
+    "Dataset class for MRI data"
+    def __init__(self, root_dir, transform=None):
+        self.root = Path(root_dir)
+        self.data_list=list(self.root.glob('*.npy'))
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.data_list)
+    
+    def __getitem__(self, idx):
+        file_path= self.data_list[idx]
+        image = np.load(file_path).astype(np.float32)
+        # Apply min-max normalization
+        image = normalize_np(image)
+        if self.transform:
+            image = self.transform(image)
+        return image 
+      
+    @staticmethod
+    def min_max_normalize(image):
+        normalized_image = (image - np.min(image)) / (np.max(image) - np.min(image))
+        return normalized_image
+    
+    
+def create_dataloader(configs,evaluation=False,transform=None):
+    shuffle =True if not evaluation else False
+    train_dataset = MRI_dataset(configs.data.root,transform=transform)
+    train_dataloader = DataLoader(train_dataset, batch_size=configs.training.batch_size, shuffle=shuffle,drop_last=True)
+    return train_dataloader

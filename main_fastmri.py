@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Training and evaluation"""
-
+import torch
 import run_lib_fastmri
 from absl import app
 from absl import flags
@@ -33,9 +33,20 @@ flags.DEFINE_string("eval_folder", "eval",
                     "The folder name for storing evaluation results")
 flags.mark_flags_as_required(["workdir", "config", "mode"])
 
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+  try:
+    # Currently, memory growth needs to be the same across GPUs
+    for gpu in gpus:
+      tf.config.experimental.set_memory_growth(gpu, True)
+    logical_gpus = tf.config.list_logical_devices('GPU')
+    print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+  except RuntimeError as e:
+    # Memory growth must be set before GPUs have been initialized
+    print(e)
 
 def main(argv):
-  print(FLAGS.config)
+  #print(FLAGS.config)
   if FLAGS.mode == "train" or FLAGS.mode == "train_regression":
     # Create the working directory
     tf.io.gfile.makedirs(FLAGS.workdir)

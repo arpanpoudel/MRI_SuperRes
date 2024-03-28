@@ -35,8 +35,10 @@ def get_config():
   # data
   data = config.data
   data.dataset = 'fastmri_knee'
-  data.root = '/media/harry/tomo/fastmri'
-  data.image_size = 320
+  data.root = '/home/arpanp/Downloads/Data/SuperResolutionProject/Data_npz'
+  data.image_size1 = 512
+  data.image_size2 = 512
+  data.reshape=True
   data.is_multi = False
   data.is_complex = False
 
@@ -47,8 +49,8 @@ def get_config():
   model.ema_rate = 0.999
   model.normalization = 'GroupNorm'
   model.nonlinearity = 'swish'
-  model.nf = 128
-  model.ch_mult = (1, 2, 2, 2)
+  model.nf = 64
+  model.ch_mult = (1, 2, 2,2)
   model.num_res_blocks = 4
   model.attn_resolutions = (16,)
   model.resamp_with_conv = True

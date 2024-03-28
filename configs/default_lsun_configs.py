@@ -8,7 +8,7 @@ def get_default_configs():
   config.training = training = ml_collections.ConfigDict()
   # config.training.batch_size = 64
   # config.training.batch_size = 2  # seriously?
-  config.training.batch_size = 1  # When using single GPU
+  config.training.batch_size = 4 # When using single GPU
   # training.n_iters = 2400001
   training.epochs = 1000
   training.snapshot_freq = 50000
@@ -22,6 +22,8 @@ def get_default_configs():
   training.likelihood_weighting = False
   training.continuous = True
   training.reduce_mean = False
+  training.save_every=10
+  training.sample_every=20
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
@@ -45,12 +47,31 @@ def get_default_configs():
   # data
   config.data = data = ml_collections.ConfigDict()
   data.dataset = 'LSUN'
-  data.image_size = 256
+  data.image_size1 = 720
+  data.image_size2 = 512  
   data.random_flip = True
   data.uniform_dequantization = False
   data.centered = False
   # data.num_channels = 3
   data.num_channels = 1
+  
+  #conditioning
+  config.conditioning = conditioning = ml_collections.ConfigDict()
+  conditioning.method = 'dps'
+  conditioning.params = ml_collections.ConfigDict()
+  conditioning.params.scale = 0.28
+  
+  #measurement 
+  config.measurement = measurement = ml_collections.ConfigDict()
+  measurement.operator = operator = ml_collections.ConfigDict()
+  measurement.operator.name='resize_superresolution'
+  
+  measurement.operator.scale_factor=2
+  measurement.operator.in_shape=[1,1,720,512]
+  #measurement.operator.ckpt_filename='/home/arpanp/FusionNet/workdir_perceptual_0.95/checkpoints/checkpoint_90.pth'
+  measurement.noise = noise = ml_collections.ConfigDict()
+  measurement.noise.name='gaussian'
+  measurement.noise.sigma=-0.05
 
   # model
   config.model = model = ml_collections.ConfigDict()
@@ -73,6 +94,7 @@ def get_default_configs():
   optim.grad_clip = 1.
 
   config.seed = 42
-  config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+  config.device='cuda:0'
+  #config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
   return config

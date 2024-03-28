@@ -12,12 +12,15 @@
 
 # Folders #
 ###########
-build/
-dist/
-*.egg-info/
-__pycache__/
-.eggs/
-
-
-weights/
+op/
 results/
+results_final/
+work_dir/
+work_dir_512/
+work_dir_gan_shape/
+
+
+
+fastmri_utils.py
+test.ipynb
+
